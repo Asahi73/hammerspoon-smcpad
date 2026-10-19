@@ -1,7 +1,7 @@
 #!/bin/sh
 # Windows互換モードのインストール / アンインストール
-#   ./install.sh              … 今の ~/.hammerspoon/init.lua を退避して、このモードに切り替える
-#   ./install.sh --uninstall  … 退避しておいた元の init.lua に戻す
+#   ./install.sh              既存の ~/.hammerspoon/init.lua を退避し、本設定へのリンクを作成する
+#   ./install.sh --uninstall  リンクを削除し、退避した init.lua を復元する
 set -eu
 
 SRC="$(cd "$(dirname "$0")" && pwd)/init.lua"
@@ -9,12 +9,12 @@ DST="$HOME/.hammerspoon/init.lua"
 BAK="$HOME/.hammerspoon/init.lua.before-wincompat"
 
 reload() {
-  # Hammerspoon が起動中で hs コマンドが入っていれば自動で再読み込みする
+  # Hammerspoon が起動中かつ hs コマンドが利用可能な場合は、設定を再読み込みする
   if command -v hs >/dev/null 2>&1 && pgrep -q Hammerspoon; then
     hs -c 'hs.reload()' >/dev/null 2>&1 || true
-    echo "Hammerspoon を再読み込みしました。"
+    echo "Hammerspoon の設定を再読み込みした。"
   else
-    echo "Hammerspoon のコンソールで hs.reload() を実行してください。"
+    echo "Hammerspoon コンソールで hs.reload() を実行すること。"
   fi
 }
 
@@ -39,10 +39,10 @@ if [ -L "$DST" ] && [ "$(readlink "$DST")" = "$SRC" ]; then
   exit 0
 fi
 
-# 既存の設定を退避（すでに退避済みなら上書きしない＝最初の状態に必ず戻せる）
+# 既存の設定を退避する。退避先が存在する場合は上書きせず中断し、導入前の設定を保護する
 if [ -e "$DST" ] || [ -L "$DST" ]; then
   if [ -e "$BAK" ] || [ -L "$BAK" ]; then
-    echo "退避先 $BAK が既にあります。先に --uninstall するか手動で確認してください。" >&2
+    echo "退避先 $BAK が既に存在する。--uninstall を実行するか、内容を確認すること。" >&2
     exit 1
   fi
   mv "$DST" "$BAK"

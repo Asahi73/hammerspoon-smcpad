@@ -1,25 +1,24 @@
 -- =====================================================================
 -- Windows互換モード (Hammerspoon)
 -- =====================================================================
--- Windowsユーザーが一時的にMacを使うときに、手癖のまま操作できるようにする。
--- キーは「刻印」ではなく「位置」で合わせる:
---   左下隅の ⌃ (Windowsの Ctrl の位置) → Ctrl系ショートカット
---   スペース横の ⌘ (Windowsの Alt の位置) → Alt+Tab / Alt+F4
+-- Windows のキー操作を macOS 上で再現する。
+-- キーの対応は刻印ではなく物理位置に基づく。
+--   左下隅の ⌃ (Windows の Ctrl の位置) → Ctrl 系ショートカット
+--   スペース横の ⌘ (Windows の Alt の位置) → Alt+Tab / Alt+F4
 --
--- 主な機能:
---   1. ⌃C/V/X/Z/Y/A/S/F… を ⌘ に変換（ターミナル系アプリは変換しない）
+-- 機能:
+--   1. ⌃C/V/X/Z/Y/A/S/F 等を ⌘ に変換する（除外アプリでは変換しない）
 --   2. Home/End → 行頭/行末、⌃←/→ → 単語移動、⌃Backspace → 単語削除
---   3. ⌘Tab（Alt+Tabの位置）→ ウィンドウ単位の切替、⌘F4 → ウィンドウを閉じる
---   4. メニューバーの「Win」をクリック or ⌃⌥⌘W で ON/OFF
+--   3. ⌘Tab → ウィンドウ単位の切替、⌘F4 → ウィンドウを閉じる
+--   4. メニューバーの Win 表示のクリック、または ⌃⌥⌘W で有効/無効を切り替える
 --
--- OSの設定は一切変更しない。Hammerspoonを終了すれば素のMacに戻る。
--- 再読み込み: Hammerspoonコンソールで hs.reload()
+-- 設定変更後は Hammerspoon コンソールで hs.reload() を実行する。
 -- =====================================================================
 
 -- ▼▼▼ 環境に合わせて変更する箇所 ▼▼▼ -----------------------------------
 
--- 変換しないアプリ（bundle ID）。ターミナルでは ⌃C = 中断 などをそのまま使うため。
--- bundle ID の調べ方: osascript -e 'id of app "iTerm"'
+-- 変換の対象外とするアプリの bundle ID。
+-- ⌃ 付きのキーに固有の機能を割り当てているアプリを登録する。
 local EXCLUDE_APPS = {
   ["com.apple.Terminal"]          = true,
   ["com.googlecode.iterm2"]       = true,
@@ -31,34 +30,36 @@ local EXCLUDE_APPS = {
   ["org.alacritty"]               = true,
 }
 
--- ⌃+キー → ⌘+キー に変換するキー。値は変換後のキー（shift = true で ⇧ を足す）。
--- ⌃⇧+キーは ⌘⇧+キー になる（例: ⌃⇧T → ⌘⇧T でタブを開き直す）。
+-- ⌃+キー を ⌘+キー に変換する対象。値で変換後のキーと ⇧ の付加を指定できる。
+-- ⌃⇧+キー は ⌘⇧+キー に変換する。
 local CTRL_TO_CMD = {
   a = {}, c = {}, v = {}, x = {}, z = {},
   s = {}, f = {}, n = {}, o = {}, p = {},
   w = {}, t = {}, r = {}, l = {},
   b = {}, i = {}, u = {},
-  y = { key = "z", shift = true },  -- やり直し: Windows Ctrl+Y → Mac ⌘⇧Z
+  y = { key = "z", shift = true },  -- やり直し: Ctrl+Y → ⌘⇧Z
 }
 
--- ON/OFF 切替のホットキー
+-- 有効/無効を切り替えるホットキー
 local TOGGLE_MODS, TOGGLE_KEY = { "ctrl", "alt", "cmd" }, "w"
 
--- 起動時に有効にするか
+-- 読み込み時に有効にするか
 local ENABLED_ON_START = true
 
 -- ▲▲▲ 変更箇所ここまで ▲▲▲ ------------------------------------------
 
 local K = hs.keycodes.map
 
--- Hammerspoon はローカル変数しか参照していないオブジェクトをGCで回収することがある。
--- eventtap やホットキーが突然効かなくなるのを防ぐため、グローバルな表に保持する。
+-- ローカル変数からのみ参照されるオブジェクトは GC で回収され、
+-- eventtap やホットキーが停止する。グローバルな表に保持して回収を防ぐ。
 WinCompat = WinCompat or {}
 local M = WinCompat
 
 -- ---------------------------------------------------------------------
--- 最前面アプリ（毎キー問い合わせると重いので、切替時にだけ更新する）
+-- 最前面アプリの記録
 -- ---------------------------------------------------------------------
+-- キー入力ごとに最前面アプリを問い合わせる処理を避けるため、
+-- アプリ切替時に bundle ID を記録し、キー変換ではその値を参照する。
 local function currentBundleID()
   local app = hs.application.frontmostApplication()
   return app and app:bundleID()
@@ -74,8 +75,8 @@ end)
 -- ---------------------------------------------------------------------
 -- 1 & 2. キー変換（eventtap）
 -- ---------------------------------------------------------------------
--- 新しいイベントを送り直すのではなく、届いたイベントのキーと修飾キーを書き換えて流す。
--- こうすると変換後のキーが再びこの関数に入ってくる（無限ループ）心配がない。
+-- 受け取ったイベントのキーコードと修飾キーを書き換えて通過させる。
+-- 新しいイベントを送出しないため、変換後のイベントが再びこの処理に入ることはない。
 
 -- keycode → 変換ルール
 local ctrlRules = {}
@@ -83,12 +84,12 @@ for key, rule in pairs(CTRL_TO_CMD) do
   ctrlRules[K[key]] = { code = K[rule.key or key], shift = rule.shift }
 end
 
--- 修飾キーを置き換える。矢印キー等は fn フラグ付きで届くので、それは残す。
+-- 修飾キーを置き換える。矢印キー等に付く fn フラグは維持する。
 local function rewrite(e, code, flags, orig)
   flags.fn = orig.fn
   e:setKeyCode(code)
   e:setFlags(flags)
-  return false  -- false = 書き換えたイベントをそのまま流す
+  return false  -- false: 書き換えたイベントを通過させる
 end
 
 local function onKey(e)
@@ -98,7 +99,7 @@ local function onKey(e)
   local f = e:getFlags()
   local shift = f.shift or nil
 
-  -- ⌃ 単独（⇧ は可）
+  -- ⌃ のみ（⇧ の併用は可）
   if f.ctrl and not f.cmd and not f.alt then
     local rule = ctrlRules[code]
     if rule then
@@ -119,7 +120,7 @@ local function onKey(e)
     return false
   end
 
-  -- 修飾なし（⇧ は可）の Home/End → 行頭/行末
+  -- 修飾キーなし（⇧ の併用は可）の Home/End → 行頭/行末
   if not f.ctrl and not f.cmd and not f.alt then
     if code == K.home then
       return rewrite(e, K.left, { cmd = true, shift = shift }, f)
@@ -132,27 +133,27 @@ local function onKey(e)
   return false
 end
 
--- keyUp も同じ規則で書き換え、押下と離上の組み合わせを揃える。
+-- keyDown と keyUp に同じ規則を適用し、押下と離上の対応を揃える。
 M.keyTap = hs.eventtap.new(
   { hs.eventtap.event.types.keyDown, hs.eventtap.event.types.keyUp }, onKey)
 
--- macOS は処理が遅れた eventtap を黙って無効化することがある。定期的に確認して戻す。
+-- macOS は応答が遅延した eventtap を無効化する。一定間隔で状態を確認し、再開する。
 M.tapWatchdog = hs.timer.new(5, function()
   if M.enabled and not M.keyTap:isEnabled() then
-    print("[wincompat] eventtap が止まっていたので再開")
+    print("[wincompat] eventtap を再開")
     M.keyTap:start()
   end
 end)
 
 -- ---------------------------------------------------------------------
--- 3. Alt+Tab / Alt+F4（位置ベースなので ⌘Tab / ⌘F4）
+-- 3. Alt+Tab / Alt+F4（物理位置に合わせて ⌘Tab / ⌘F4 に割り当てる）
 -- ---------------------------------------------------------------------
--- hs.window.switcher は修飾キーを離した時点で選択中のウィンドウへ切り替える。
+-- hs.window.switcher は修飾キーを離した時点で選択中のウィンドウに切り替える。
 M.switcher = hs.window.switcher.new()
 M.switcher.ui.showThumbnails = false
 M.switcher.ui.showSelectedThumbnail = false
 
--- Windows の Alt+F4: ウィンドウを閉じる。そのアプリの最後のウィンドウならアプリを終了する。
+-- Alt+F4 相当: ウィンドウを閉じる。アプリの最後のウィンドウであればアプリを終了する。
 local function closeLikeWindows()
   local win = hs.window.focusedWindow()
   if not win then return end
@@ -163,9 +164,9 @@ local function closeLikeWindows()
     if w:isStandard() then count = count + 1 end
   end
 
-  -- Finder は終了させない（デスクトップが消えたように見えるため）
+  -- Finder は終了の対象外とする（デスクトップ表示を担うため）
   if count <= 1 and app:bundleID() ~= "com.apple.finder" then
-    app:kill()   -- kill() は通常の終了（⌘Q 相当）。強制終了は kill9()
+    app:kill()   -- 通常の終了（⌘Q 相当）。強制終了は kill9()
   else
     win:close()
   end
@@ -181,7 +182,7 @@ M.hotkeys = {
 }
 
 -- ---------------------------------------------------------------------
--- 4. ON / OFF
+-- 4. 有効 / 無効の切替
 -- ---------------------------------------------------------------------
 M.menubar = M.menubar or hs.menubar.new()
 
@@ -202,10 +203,10 @@ local function setEnabled(on)
 
   if M.menubar then
     M.menubar:setTitle(on and "Win" or "Mac")
-    M.menubar:setTooltip(on and "Windows互換: ON（クリックでOFF）"
-                              or "Windows互換: OFF（クリックでON）")
+    M.menubar:setTooltip(on and "Windows互換: 有効（クリックで無効化）"
+                              or "Windows互換: 無効（クリックで有効化）")
   end
-  hs.alert.show(on and "Windows互換 ON" or "Windows互換 OFF（素のMac）")
+  hs.alert.show(on and "Windows互換: 有効" or "Windows互換: 無効")
 end
 
 local function toggle() setEnabled(not M.enabled) end
