@@ -1,14 +1,16 @@
 -- =====================================================================
 -- Macエンジニア向け Hammerspoon 設定（1ファイル完結）
 -- =====================================================================
--- Caps Lock を Hyper キーにして、次の5つを使えるようにする。Karabiner は不要。
+-- 右⌘ を Hyper キーにして、次の5つを使えるようにする。Karabiner は不要。
 --   1. Hyper + 文字   アプリを起動/前面化（前面ならもう一度押すと隠す）
 --   2. Hyper + Space  コマンドパレット（URL・スニペット・シェルコマンド・アプリ）
 --   3. Hyper + V      クリップボード履歴
 --   4. 保存で自動リロード
---   5. Hyper + /      割り当て一覧（チートシート）
+--   5. Hyper 長押し   割り当て一覧（チートシート）
 --
--- 単押しの Caps Lock は Escape になる（TAP_ESCAPE で切替）。
+-- 右⌘ は右手親指で押さえるので、割り当ては左手のキー中心にしている（両手で分担でき楽）。
+-- Caps Lock には触れないので、Caps Lock での入力切替などの既存設定はそのまま使える。
+-- 割り当てていないキーは右⌘でも普通の ⌘ ショートカットとして動く（右⌘+V だけは履歴になる）。
 --
 -- 使い方（既存の ~/.hammerspoon/init.lua は退避してから）:
 --   ln -s "$PWD/hammerspoon/variants/mac-engineer/init.lua" ~/.hammerspoon/init.lua
@@ -17,8 +19,8 @@
 
 -- ▼▼▼ 環境に合わせて変更する箇所 ▼▼▼ -----------------------------------
 
--- Caps Lock を単押ししたときに Escape を送るか
-local TAP_ESCAPE = true
+-- 右⌘ をこの秒数だけ単独で押し続けると割り当て一覧を出す
+local CHEAT_HOLD_SEC = 1.0
 
 -- クリップボード履歴の最大件数
 local CLIP_MAX = 30
@@ -30,7 +32,7 @@ local APPS = {
   { key = "t", desc = "ターミナル",   name = "Terminal",           bundleIDs = { "com.mitchellh.ghostty", "com.googlecode.iterm2", "com.apple.Terminal" } },
   { key = "b", desc = "ブラウザ",     name = "Google Chrome",      bundleIDs = { "com.google.Chrome", "company.thebrowser.Browser", "com.apple.Safari" } },
   { key = "s", desc = "Slack",        name = "Slack",              bundleIDs = { "com.tinyspeck.slackmacgap" } },
-  { key = "n", desc = "メモ",         name = "Notes",              bundleIDs = { "com.apple.Notes" } },
+  { key = "w", desc = "メモ",         name = "Notes",              bundleIDs = { "com.apple.Notes" } },
   { key = "f", desc = "Finder",       name = "Finder",             bundleIDs = { "com.apple.finder" } },
 }
 
@@ -52,46 +54,72 @@ local PALETTE = {
 macEngineer = {}
 
 -- ---------------------------------------------------------------------
--- Hyperキー
+-- Hyperキー（右⌘）
 -- ---------------------------------------------------------------------
--- macOS 標準の hidutil で Caps Lock を F18 に割り当て、F18 を押している間だけ
--- 有効になるモーダルを Hyper として使う。hidutil の割り当ては再起動で消えるので、
--- Hammerspoon の起動（=ログイン時）ごとに設定し直す。
--- 注意: hidutil の UserKeyMapping は上書きなので、他に hidutil で割り当てていれば消える。
--- 元に戻す: hidutil property --set '{"UserKeyMapping":[]}'
-local CAPS_LOCK = 0x700000039
-local F18       = 0x70000006D
+-- hs.hotkey は左右の ⌘ を区別できないので、hs.eventtap でキー入力を直接見る。
+--   ・右⌘ の押下/解放は flagsChanged イベントの「右⌘ビット」で判定する
+--   ・右⌘ を押している間のキー入力のうち、割り当てたキーだけを横取りする
+-- 判定はイベント自身の右⌘ビットで行うので、この設定が送る ⌘V 等の合成キーには反応しない。
+local RIGHT_CMD_BIT = hs.eventtap.event.rawFlagMasks.deviceRightCommand
+local evt = hs.eventtap.event.types
 
-local function remapCapsLock()
-  local json = string.format(
-    '{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":0x%X,"HIDKeyboardModifierMappingDst":0x%X}]}',
-    CAPS_LOCK, F18)
-  local _, ok = hs.execute("/usr/bin/hidutil property --set '" .. json .. "'")
-  if not ok then print("[hyper] hidutil での Caps Lock 割り当てに失敗") end
-end
-
-local hyper = hs.hotkey.modal.new()
-local hyperUsed = false          -- Hyper 中に何か押したか（単押し判定用）
-local hyperBindings = {}         -- チートシート用 { key, desc }
+local hyperBindings = {}   -- チートシート用 { key, desc }（登録順）
+local hyperActions  = {}   -- keycode → 処理
+local hyperDown     = false
+local hyperUsed     = false
+local holdTimer     = nil
+local swallowed     = {}   -- 横取りした keyDown の keycode（対応する keyUp も捨てる）
+local showCheatsheet, hideCheatsheet   -- 5. で定義
 
 local function hyperBind(key, desc, fn)
   hyperBindings[#hyperBindings + 1] = { key = key, desc = desc }
-  hyper:bind({}, key, function()
-    hyperUsed = true
-    fn()
-  end)
+  hyperActions[hs.keycodes.map[key]] = fn
 end
 
-remapCapsLock()
-macEngineer.hyperKey = hs.hotkey.bind({}, "f18",
-  function()
-    hyperUsed = false
-    hyper:enter()
-  end,
-  function()
-    hyper:exit()
-    if TAP_ESCAPE and not hyperUsed then hs.eventtap.keyStroke({}, "escape", 0) end
-  end)
+local function isRightCmd(e)
+  return (e:rawFlags() & RIGHT_CMD_BIT) ~= 0
+end
+
+macEngineer.hyperTap = hs.eventtap.new({ evt.flagsChanged, evt.keyDown, evt.keyUp }, function(e)
+  local t, code = e:getType(), e:getKeyCode()
+
+  if t == evt.flagsChanged then
+    local down = isRightCmd(e)
+    if down and not hyperDown then
+      hyperDown, hyperUsed = true, false
+      holdTimer = hs.timer.doAfter(CHEAT_HOLD_SEC, function()
+        if hyperDown and not hyperUsed then showCheatsheet() end
+      end)
+    elseif not down and hyperDown then
+      hyperDown = false
+      if holdTimer then holdTimer:stop(); holdTimer = nil end
+      hideCheatsheet()
+    end
+    return false
+  end
+
+  if t == evt.keyUp then
+    if swallowed[code] then swallowed[code] = nil; return true end
+    return false
+  end
+
+  -- keyDown
+  if not (hyperDown and isRightCmd(e)) then return false end
+  hyperUsed = true
+  local fn = hyperActions[code]
+  if not fn then return false end               -- 未割り当ては普通の ⌘ ショートカットとして通す
+  swallowed[code] = true
+  -- キーリピートは無視。タップの中で重い処理をしないよう、処理は次のループで実行する
+  if e:getProperty(hs.eventtap.event.properties.keyboardEventAutorepeat) == 0 then
+    hs.timer.doAfter(0, fn)
+  end
+  return true
+end):start()
+
+-- 長時間の処理などで macOS にタップを止められることがあるので、止まっていたら再開する
+macEngineer.hyperWatchdog = hs.timer.doEvery(5, function()
+  if not macEngineer.hyperTap:isEnabled() then macEngineer.hyperTap:start() end
+end)
 
 -- ---------------------------------------------------------------------
 -- 共通: 貼り付け
@@ -240,24 +268,26 @@ if realDir and realDir ~= hs.configdir then
 end
 
 -- ---------------------------------------------------------------------
--- 5. チートシート
+-- 5. チートシート（右⌘ を長押しすると表示、離すと消える）
 -- ---------------------------------------------------------------------
 local KEY_LABEL = { space = "Space" }
 local cheatAlert = nil
 
-hyperBind("/", "この一覧", function()
-  if cheatAlert then
-    hs.alert.closeSpecific(cheatAlert)
-    cheatAlert = nil
-    return
-  end
-  local lines = { "Hyper (Caps Lock) +" }
+function showCheatsheet()
+  local lines = { "右⌘ +" }
   for _, b in ipairs(hyperBindings) do
     lines[#lines + 1] = string.format("  %-6s %s", KEY_LABEL[b.key] or b.key:upper(), b.desc)
   end
+  lines[#lines + 1] = "  長押し  この一覧"
   cheatAlert = hs.alert.show(table.concat(lines, "\n"),
-    { textFont = "Menlo", textSize = 18, atScreenEdge = 0 }, hs.screen.mainScreen(), 6)
-  hs.timer.doAfter(6, function() cheatAlert = nil end)
-end)
+    { textFont = "Menlo", textSize = 18, atScreenEdge = 0 }, hs.screen.mainScreen(), true)   -- 秒数に数値以外を渡すと消すまで表示
+end
+
+function hideCheatsheet()
+  if cheatAlert then
+    hs.alert.closeSpecific(cheatAlert)
+    cheatAlert = nil
+  end
+end
 
 hs.alert.show("Hammerspoon: 設定を読み込みました")
