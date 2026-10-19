@@ -7,6 +7,14 @@
 --   3. クリップボード履歴
 --   4. 設定ファイル保存時の自動リロード
 --   5. 割り当て一覧（チートシート）
+--   6. ウィンドウ配置（左半分 / 右半分 / 最大化）
+--   7. 直前のアプリへ戻る
+--   8. ブラウザのページを Markdown リンクでコピー
+--   9. アプリごとの入力ソース自動切替
+--  10. 指定 Wi-Fi から切断されたら VPN アプリを起動
+--  11. 外部モニタ接続時のウィンドウ配置
+--  12. スリープ復帰時のアプリ前面化
+--  13. 長いコマンドの完了通知（hs コマンドから呼ぶ）
 --
 -- 導入方法・キー割り当て・カスタマイズは同じフォルダの README.md を参照。
 -- =====================================================================
@@ -40,6 +48,30 @@ local PALETTE = {
   { kind = "shell",   text = "Homebrew を更新",         value = "brew update && brew upgrade" },
   { kind = "shell",   text = "Downloads を開く",        value = "open ~/Downloads" },
 }
+
+-- アプリが前面に来たときの入力ソース。"en" = 英数、"ja" = かな
+local INPUT_BY_APP = {
+  ["com.mitchellh.ghostty"]     = "en",
+  ["com.googlecode.iterm2"]     = "en",
+  ["com.apple.Terminal"]        = "en",
+  ["com.microsoft.VSCode"]      = "en",
+  ["com.tinyspeck.slackmacgap"] = "ja",
+}
+
+-- この SSID のいずれかから切断されたら、VPN アプリを起動する
+local WIFI_VPN = {
+  ssids = { "Office-WiFi" },
+  app   = { name = "Tunnelblick", bundleIDs = { "net.tunnelblick.tunnelblick" } },
+}
+
+-- 外部モニタ接続時に、外部モニタへ移して配置するアプリ。position は left / right / max
+local MONITOR_LAYOUT = {
+  { position = "left",  app = { name = "Visual Studio Code", bundleIDs = { "com.microsoft.VSCode" } } },
+  { position = "right", app = { name = "Google Chrome",      bundleIDs = { "com.google.Chrome" } } },
+}
+
+-- スリープ復帰時に前面化するアプリ
+local WAKE_APP = { name = "Slack", bundleIDs = { "com.tinyspeck.slackmacgap" } }
 
 -- ▲▲▲ 変更箇所ここまで ▲▲▲ ------------------------------------------
 
@@ -263,7 +295,7 @@ end
 -- ---------------------------------------------------------------------
 -- 5. チートシート（右⌘ の長押し中だけ表示）
 -- ---------------------------------------------------------------------
-local KEY_LABEL = { space = "Space" }
+local KEY_LABEL = { space = "Space", tab = "Tab" }
 local cheatAlert = nil
 
 function showCheatsheet()
@@ -281,6 +313,173 @@ function hideCheatsheet()
     hs.alert.closeSpecific(cheatAlert)
     cheatAlert = nil
   end
+end
+
+-- ---------------------------------------------------------------------
+-- 6. ウィンドウ配置
+-- ---------------------------------------------------------------------
+-- 右⌘ を押さえた右手の指がホーム段にあるので、H / K / L を使う。
+local UNITS = {
+  left  = { x = 0,   y = 0, w = 0.5, h = 1 },
+  right = { x = 0.5, y = 0, w = 0.5, h = 1 },
+  max   = { x = 0,   y = 0, w = 1,   h = 1 },
+}
+
+local function placeFocused(position)
+  local win = hs.window.focusedWindow()
+  if win then win:moveToUnit(UNITS[position], 0) end
+end
+
+hyperBind("h", "左半分", function() placeFocused("left") end)
+hyperBind("l", "右半分", function() placeFocused("right") end)
+hyperBind("k", "最大化", function() placeFocused("max") end)
+
+-- ---------------------------------------------------------------------
+-- 7. 直前のアプリへ戻る ／ 9. 入力ソース自動切替
+-- ---------------------------------------------------------------------
+-- どちらも「アプリが前面に来た」イベントで動くので、watcher を1つにまとめる。
+-- 入力ソースは JIS キーボードの英数 / かなキーを送って切り替える。
+-- 入力ソースIDを直接指定する方式と違い、ことえり・Google 日本語入力などIMEを問わず動く。
+local HS_BUNDLE = "org.hammerspoon.Hammerspoon"
+local KEY_EISU, KEY_KANA = 102, 104
+local currentApp  = hs.application.frontmostApplication()
+local previousApp = nil
+
+local function setInput(kind)
+  local code = (kind == "ja") and KEY_KANA or KEY_EISU
+  hs.eventtap.event.newKeyEvent({}, code, true):post()
+  hs.eventtap.event.newKeyEvent({}, code, false):post()
+end
+
+macEngineer.appWatcher = hs.application.watcher.new(function(_, event, app)
+  if event ~= hs.application.watcher.activated or not app then return end
+  local id = app:bundleID()
+  -- パレット等を開くと Hammerspoon 自身が前面に来るので、履歴にも入力切替にも含めない
+  if id == HS_BUNDLE then return end
+  if not currentApp or currentApp:pid() ~= app:pid() then
+    previousApp, currentApp = currentApp, app
+  end
+  if INPUT_BY_APP[id] then setInput(INPUT_BY_APP[id]) end
+end):start()
+
+hyperBind("tab", "直前のアプリ", function()
+  if previousApp and previousApp:isRunning() then previousApp:activate() end
+end)
+
+-- ---------------------------------------------------------------------
+-- 8. Markdown リンクのコピー
+-- ---------------------------------------------------------------------
+-- ブラウザごとに AppleScript でタイトルと URL を取る（初回は macOS が操作の許可を求める）。
+local BROWSER_SCRIPTS = {
+  ["com.google.Chrome"]          = 'tell application "Google Chrome" to return {title, URL} of active tab of front window',
+  ["company.thebrowser.Browser"] = 'tell application "Arc" to return {title, URL} of active tab of front window',
+  ["com.apple.Safari"]           = 'tell application "Safari" to return {name, URL} of front document',
+}
+
+hyperBind("r", "ページをMDリンクでコピー", function()
+  local app = hs.application.frontmostApplication()
+  local script = app and BROWSER_SCRIPTS[app:bundleID()]
+  if not script then
+    hs.alert.show("ブラウザが前面にない")
+    return
+  end
+  local ok, res = hs.osascript.applescript(script)
+  if not ok or type(res) ~= "table" or not res[2] then
+    hs.alert.show("ページ情報を取得できない")
+    return
+  end
+  -- タイトル中の [ ] はリンク記法を壊すのでエスケープする
+  local link = string.format("[%s](%s)", tostring(res[1]):gsub("[%[%]]", "\\%0"), res[2])
+  hs.pasteboard.setContents(link)
+  hs.alert.show("コピー: " .. link)
+end)
+
+-- ---------------------------------------------------------------------
+-- 10. Wi-Fi 切断で VPN アプリを起動
+-- ---------------------------------------------------------------------
+-- 直前の SSID を覚えておき、「指定 SSID → それ以外（未接続を含む）」の変化だけを拾う。
+local function contains(list, value)
+  for _, v in ipairs(list) do
+    if v == value then return true end
+  end
+  return false
+end
+
+local lastSSID = hs.wifi.currentNetwork()
+macEngineer.wifiWatcher = hs.wifi.watcher.new(function()
+  local ssid = hs.wifi.currentNetwork()
+  if ssid == lastSSID then return end
+  if contains(WIFI_VPN.ssids, lastSSID) and not contains(WIFI_VPN.ssids, ssid) then
+    hs.alert.show("Wi-Fi から切断: VPN を起動")
+    launchApp(WIFI_VPN.app)
+  end
+  lastSSID = ssid
+end):start()
+
+-- ---------------------------------------------------------------------
+-- 11. 外部モニタ接続時のウィンドウ配置
+-- ---------------------------------------------------------------------
+-- 画面数が増えたときだけ動く。接続直後は画面の並びが確定していないので少し待つ。
+local function isBuiltin(screen)
+  local name = screen:name() or ""
+  return name:match("Built%-in") ~= nil or name:match("内蔵") ~= nil
+end
+
+local function externalScreen()
+  for _, screen in ipairs(hs.screen.allScreens()) do
+    if not isBuiltin(screen) then return screen end
+  end
+  return nil
+end
+
+local function applyMonitorLayout()
+  local ext = externalScreen()
+  if not ext then return end
+  for _, item in ipairs(MONITOR_LAYOUT) do
+    local app = runningApp(item.app)
+    for _, win in ipairs(app and app:allWindows() or {}) do
+      if win:isStandard() then
+        win:moveToScreen(ext, false, true, 0)
+        win:moveToUnit(UNITS[item.position], 0)
+      end
+    end
+  end
+end
+
+local screenCount = #hs.screen.allScreens()
+macEngineer.screenWatcher = hs.screen.watcher.new(function()
+  local count = #hs.screen.allScreens()
+  if count > screenCount then hs.timer.doAfter(2, applyMonitorLayout) end
+  screenCount = count
+end):start()
+
+-- ---------------------------------------------------------------------
+-- 12. スリープ復帰時のアプリ前面化
+-- ---------------------------------------------------------------------
+-- 復帰直後はロック画面なので、ロック解除のタイミングでも前面化する。
+macEngineer.wakeWatcher = hs.caffeinate.watcher.new(function(event)
+  local w = hs.caffeinate.watcher
+  if event == w.systemDidWake or event == w.screensDidUnlock then
+    launchApp(WAKE_APP)
+  end
+end):start()
+
+-- ---------------------------------------------------------------------
+-- 13. 長いコマンドの完了通知
+-- ---------------------------------------------------------------------
+-- hs コマンド（hs.ipc）から notifyDone(終了コード, ラベル) を呼ぶ。
+-- hs -c から見えるよう、関数はグローバルに置く。
+require("hs.ipc")
+
+function notifyDone(status, label)
+  status = tonumber(status) or 0
+  local title = (status == 0) and "コマンド完了" or ("コマンド失敗 (" .. status .. ")")
+  hs.notify.new({
+    title = title,
+    informativeText = label or "",
+    soundName = (status == 0) and "Glass" or "Basso",
+  }):send()
+  hs.alert.show(title .. (label and label ~= "" and (": " .. label) or ""), 3)
 end
 
 hs.alert.show("Hammerspoon: 設定を読み込みました")
